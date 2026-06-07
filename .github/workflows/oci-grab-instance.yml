@@ -21,12 +21,33 @@ jobs:
     steps:
       - name: Install OCI CLI
         run: pip install oci-cli
-      - name: Skip if instance already running
+      - name: Check existing instance
         id: check
         run: |
-          RUNNING=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --display-name "$DISPLAY_NAME" --lifecycle-state RUNNING --query 'data[0].id' --raw-output 2>/dev/null || true)
-          if [ -n "$RUNNING" ] && [ "$RUNNING" != "null" ]; then
-            echo "Instance exists: $RUNNING"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "No running instance — will try apply."
+          RESULT=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --display-name "$DISPLAY_NAME" --lifecycle-state RUNNING --query "data[0].id" --raw-output 2>/dev/null || echo "none")
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+      - name: Run apply job
+        if: steps.check.outputs.result == 'none' || steps.check.outputs.result == 'null' || steps.check.outputs.result == ''
+        run: |
+          JOB_ID=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --execution-plan-strategy AUTO_APPROVED --query "data.id" --raw-output)
+          echo "Job: $JOB_ID"
+          sleep 10
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+            STATE=$(oci resource-manager job get --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output)
+            echo "  [$i] $STATE"
+            if [ "$STATE" = "SUCCEEDED" ]; then
+              echo "Server created!"
+              curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="${TG_CHAT}" -d text="Server created! Check Oracle Cloud for IP."
+              exit 0
+            fi
+            if [ "$STATE" = "FAILED" ] || [ "$STATE" = "CANCELED" ]; then
+              LOG=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null || echo "no logs")
+              echo "$LOG" | tail -n 20
+              echo "$LOG" | grep -qi "capacity" && echo "No capacity yet, will retry." && exit 0
+              echo "Failed for other reason."
+              curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="${TG_CHAT}" -d text="OCI apply failed (not capacity). Check log."
+              exit 1
+            fi
+            sleep 12
+          done
+          echo "Timed out, will retry later."
