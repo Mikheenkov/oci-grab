@@ -1,1 +1,77 @@
+name: OCI grab A1 instance
 
+# Раз в 10 минут пробует создать сервер через apply-job на стеке Resource Manager.
+# Останавливается сам, как только инстанс RUNNING (apply станет no-op, но проверка
+# в начале экономит минуты и помечает успех в логе).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+env:
+  OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+  STACK_ID:            ${{ secrets.OCI_STACK_ID }}
+  COMPARTMENT_ID:      ${{ secrets.OCI_COMPARTMENT_ID }}
+  DISPLAY_NAME:        "instance-20260607-2018"
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install OCI CLI
+        run: |
+          curl -sSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
+            | bash -s -- --accept-all-defaults --install-dir "$HOME/oci" --exec-dir "$HOME/oci/bin"
+          echo "$HOME/oci/bin" >> "$GITHUB_PATH"
+
+      - name: Skip if instance already running
+        id: check
+        run: |
+          RUNNING=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$DISPLAY_NAME" \
+            --lifecycle-state RUNNING \
+            --query 'data[0].id' --raw-output 2>/dev/null || true)
+          if [ -n "$RUNNING" ] && [ "$RUNNING" != "null" ]; then
+            echo "✅ Инстанс уже создан: $RUNNING — apply не нужен."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Свободного инстанса нет — пробуем apply."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run apply job
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set +e
+          JOB_ID=$(oci resource-manager job create-apply-job \
+            --stack-id "$STACK_ID" \
+            --execution-plan-strategy AUTO_APPROVED \
+            --query 'data.id' --raw-output)
+          echo "Job: $JOB_ID"
+
+          # Ждём финального статуса
+          for i in $(seq 1 40); do
+            STATE=$(oci resource-manager job get --job-id "$JOB_ID" \
+              --query 'data."lifecycle-state"' --raw-output)
+            echo "  [$i] $STATE"
+            case "$STATE" in
+              SUCCEEDED) echo "🎉 Сервер создан!"; exit 0 ;;
+              FAILED|CANCELED)
+                LOG=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null)
+                echo "$LOG" | tail -n 20
+                if echo "$LOG" | grep -qi "Out of host capacity\|out of capacity\|LimitExceeded\|capacity"; then
+                  echo "⏳ Всё ещё нет ёмкости — повторим через 10 минут."
+                  exit 0   # green run, чтобы не спамило ошибками
+                fi
+                echo "❌ Apply упал по другой причине — смотри лог выше."
+                exit 1 ;;
+            esac
+            sleep 12
+          done
+          echo "⏱ Job не завершился за отведённое время — повтор позже."
