@@ -22,5 +22,35 @@ jobs:
       - name: Skip if instance already running
         id: check
         run: |
-          RUNNING=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
+          RUNNING=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --display-name "$DISPLAY_NAME" --lifecycle-state RUNNING --query 'data[0].id' --raw-output 2>/dev/null || true)
+          if [ -n "$RUNNING" ] && [ "$RUNNING" != "null" ]; then
+            echo "Instance exists: $RUNNING"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No running instance — will try apply."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run apply job
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set +e
+          JOB_ID=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --execution-plan-strategy AUTO_APPROVED --query 'data.id' --raw-output)
+          echo "Job: $JOB_ID"
+          for i in $(seq 1 40); do
+            STATE=$(oci resource-manager job get --job-id "$JOB_ID" --query 'data."lifecycle-state"' --raw-output)
+            echo "  [$i] $STATE"
+            case "$STATE" in
+              SUCCEEDED) echo "Server created!"; exit 0 ;;
+              FAILED|CANCELED)
+                LOG=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null || true)
+                echo "$LOG" | tail -n 20
+                if echo "$LOG" | grep -qi "capacity"; then
+                  echo "Still no capacity — will retry in 10 min."
+                  exit 0
+                fi
+                echo "Apply failed — see log above."
+                exit 1 ;;
+            esac
+            sleep 12
+          done
+          echo "Job did not finish in time — will retry later."
