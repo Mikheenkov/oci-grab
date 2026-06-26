@@ -85,7 +85,13 @@ jobs:
             if [ -z "$img" ] || [ "$img" = "null" ]; then
               echo "Нет Ubuntu-образа под $shape (версия $UBUNTU_VER)"; return 1
             fi
-            echo ">> launch '$name' shape=$shape image=$img"
+            local imgname
+            imgname=$(oci compute image get --image-id "$img" --query 'data."display-name"' --raw-output 2>/dev/null || echo "?")
+            echo ">> launch '$name' shape=$shape image=$imgname ($img)"
+            case "$imgname" in
+              *Ubuntu*) : ;;  # ок, это Ubuntu
+              *) echo "⚠️ ВНИМАНИЕ: образ не похож на Ubuntu: $imgname";;
+            esac
             local err
             err=$(oci compute instance launch \
                     --availability-domain "$AD" -c "$COMPARTMENT_ID" \
