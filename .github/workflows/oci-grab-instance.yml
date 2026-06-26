@@ -1,53 +1,148 @@
-name: OCI grab A1 instance
+name: OCI grab (Hermes AMD micro + Ampere x2, Ubuntu)
+
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"   # каждые 10 минут
   workflow_dispatch: {}
+
+concurrency:
+  group: oci-grab
+  cancel-in-progress: false
+
 env:
+  # --- OCI auth (существующие секреты) ---
   OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
   OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
-  STACK_ID:            ${{ secrets.OCI_STACK_ID }}
   COMPARTMENT_ID:      ${{ secrets.OCI_COMPARTMENT_ID }}
-  DISPLAY_NAME:        "instance-20260607-2018"
+  # --- Telegram (существующие секреты) ---
   TG_TOKEN:            ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TG_CHAT:             ${{ secrets.TELEGRAM_CHAT_ID }}
+  # --- параметры цели ---
+  SUBNET_NAME:    "subnet-20260607-0926"   # резолвится в OCID на лету; при необходимости поменяй имя
+  SSH_PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0gCdXBEqV1WciB81/PlAT4kIgTVSROdANvY5mY23Hx nikita@openclaw"
+  UBUNTU_OS:      "Canonical Ubuntu"
+  UBUNTU_VER:     "24.04"
+
 jobs:
-  apply:
+  grab:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
       - name: Install OCI CLI
-        run: pip install oci-cli
-      - name: Check existing instance
-        id: check
+        run: pip install --quiet oci-cli
+
+      - name: Grab free-tier capacity
         run: |
-          RESULT=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --display-name "$DISPLAY_NAME" --lifecycle-state RUNNING --query "data[0].id" --raw-output 2>/dev/null || echo "none")
-          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-      - name: Run apply job
-        if: steps.check.outputs.result == 'none' || steps.check.outputs.result == 'null' || steps.check.outputs.result == ''
-        run: |
-          JOB_ID=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --execution-plan-strategy AUTO_APPROVED --query "data.id" --raw-output)
-          echo "Job: $JOB_ID"
-          sleep 10
-          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
-            STATE=$(oci resource-manager job get --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output)
-            echo "  [$i] $STATE"
-            if [ "$STATE" = "SUCCEEDED" ]; then
-              echo "Server created!"
-              curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="${TG_CHAT}" -d text="Server created! Check Oracle Cloud for IP."
-              exit 0
+          set -uo pipefail
+
+          notify() { curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                       -d chat_id="${TG_CHAT}" -d text="$1" >/dev/null || true; }
+
+          # ---------- placement (резолвим, чтобы не хардкодить OCID) ----------
+          AD=$(oci iam availability-domain list --query 'data[0].name' --raw-output)
+          SUBNET_ID=$(oci network subnet list -c "$COMPARTMENT_ID" \
+                        --display-name "$SUBNET_NAME" --query 'data[0].id' --raw-output)
+          echo "AD=$AD"
+          echo "SUBNET=$SUBNET_ID"
+          if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "null" ]; then
+            notify "⚠️ OCI-grab: subnet '$SUBNET_NAME' не найдена. Проверь имя/VCN."
+            echo "Subnet not found"; exit 1
+          fi
+
+          META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
+
+          # ---------- текущее использование (не-terminated инстансы) ----------
+          INSTS=$(oci compute instance list -c "$COMPARTMENT_ID" --all \
+                    --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING']" 2>/dev/null)
+          [ -z "$INSTS" ] && INSTS='[]'
+          n_e2=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.E2.1.Micro")]|length')
+          n_a1=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.A1.Flex")]|length')
+          a1_ocpus=$(echo "$INSTS" | jq '([.[]|select(.shape=="VM.Standard.A1.Flex")|."shape-config".ocpus]|add // 0)|floor')
+          echo "Usage: E2.1.Micro=$n_e2/2 ; A1 instances=$n_a1 ; A1 ocpus=$a1_ocpus/4"
+
+          # свободные слоты в Always Free
+          amd_free=$([ "$n_e2" -lt 2 ] && echo 1 || echo 0)                          # макс 2 AMD-микро
+          arm_free=$([ "$n_a1" -lt 2 ] && [ "$a1_ocpus" -le 2 ] && echo 1 || echo 0)  # ещё один 2/12 влезает
+
+          exists() { echo "$INSTS" | jq -e --arg n "$1" 'any(.[]; ."display-name"==$n)' >/dev/null; }
+
+          ubuntu_img() {  # $1 = shape ; вернёт OCID свежего Ubuntu под арх. этого шейпа
+            oci compute image list -c "$COMPARTMENT_ID" \
+              --operating-system "$UBUNTU_OS" --operating-system-version "$UBUNTU_VER" \
+              --shape "$1" --sort-by TIMECREATED --sort-order DESC \
+              --query 'data[0].id' --raw-output
+          }
+
+          # launch: rc 0=ok, 10=no-capacity, 20=rate-limit, 1=other
+          launch() {  # $1 name  $2 shape  [extra args...]
+            local name="$1" shape="$2"; shift 2
+            local img; img=$(ubuntu_img "$shape")
+            if [ -z "$img" ] || [ "$img" = "null" ]; then
+              echo "Нет Ubuntu-образа под $shape (версия $UBUNTU_VER)"; return 1
             fi
-            if [ "$STATE" = "FAILED" ] || [ "$STATE" = "CANCELED" ]; then
-              LOG=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null || echo "no logs")
-              echo "$LOG" | tail -n 20
-              echo "$LOG" | grep -qi "capacity" && echo "No capacity yet, will retry." && exit 0
-              echo "Failed for other reason."
-              curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="${TG_CHAT}" -d text="OCI apply failed (not capacity). Check log."
-              exit 1
+            echo ">> launch '$name' shape=$shape image=$img"
+            local err
+            err=$(oci compute instance launch \
+                    --availability-domain "$AD" -c "$COMPARTMENT_ID" \
+                    --shape "$shape" --image-id "$img" --subnet-id "$SUBNET_ID" \
+                    --assign-public-ip true --display-name "$name" \
+                    --metadata "$META" "$@" 2>&1) && { echo "OK: $name"; return 0; }
+            echo "$err" | tail -6
+            echo "$err" | grep -qiE "out of (host )?capacity|capacity"        && return 10
+            echo "$err" | grep -qiE "too many requests|toomanyrequests|429"   && return 20
+            return 1
+          }
+
+          # ---------- чередование: каждый запуск пробуем ОДНУ цель ----------
+          slot=$(( ($(date +%s) / 600) % 2 ))      # 0 = AMD, 1 = Ampere
+          [ "$slot" -eq 0 ] && order="amd ampere" || order="ampere amd"
+          echo "slot=$slot order=$order"
+
+          for target in $order; do
+
+            # ----- AMD micro (Hermes) -----
+            if [ "$target" = "amd" ]; then
+              if [ "$amd_free" != 1 ] || exists "Hermes"; then
+                echo "AMD: слот занят/недоступен — пропускаю"; continue
+              fi
+              launch "Hermes" "VM.Standard.E2.1.Micro"; rc=$?
+              case $rc in
+                0)  notify "✅ Hermes (AMD E2.1.Micro, Ubuntu) создан! Смотри IP в OCI Console."; exit 0;;
+                10) echo "AMD: нет ёмкости, ждём следующего слота"; exit 0;;
+                20) echo "AMD: rate-limit, ждём"; exit 0;;
+                *)  notify "⚠️ OCI-grab: Hermes launch упал (не ёмкость). Смотри лог Actions."; exit 1;;
+              esac
             fi
-            sleep 12
+
+            # ----- Ampere A1.Flex 2/12 (Ampere 1, затем Ampere 2) -----
+            if [ "$target" = "ampere" ]; then
+              if [ "$arm_free" != 1 ]; then
+                echo "Ampere: ARM-пул занят — пропускаю"; continue
+              fi
+              name="Ampere 1"; exists "Ampere 1" && name="Ampere 2"
+              if exists "$name"; then echo "Ampere: оба имени заняты"; continue; fi
+
+              launch "$name" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}'; rc=$?
+              case $rc in
+                0)
+                  notify "✅ $name (Ampere A1.Flex 2 OCPU / 12 GB, Ubuntu) создан!"
+                  # поймали первый Ampere из пустого пула → сразу пробуем второй
+                  if [ "$name" = "Ampere 1" ] && [ "$a1_ocpus" -eq 0 ]; then
+                    echo ">> сразу пробуем второй Ampere"
+                    sleep 5
+                    launch "Ampere 2" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}'; rc2=$?
+                    [ "$rc2" -eq 0 ] && notify "✅ Ampere 2 (A1.Flex 2/12, Ubuntu) тоже создан! ARM-пул заполнен (4/24)." \
+                                     || echo "Второй Ampere пока не поймался (rc=$rc2), добьём в следующем слоте."
+                  fi
+                  exit 0;;
+                10) echo "Ampere: нет ёмкости, ждём следующего слота"; exit 0;;
+                20) echo "Ampere: rate-limit, ждём"; exit 0;;
+                *)  notify "⚠️ OCI-grab: $name launch упал (не ёмкость). Смотри лог Actions."; exit 1;;
+              esac
+            fi
           done
-          echo "Timed out, will retry later."
+
+          echo "В этот запуск ловить нечего: все цели заняты или квоты исчерпаны."
