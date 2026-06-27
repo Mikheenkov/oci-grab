@@ -2,12 +2,13 @@ name: OCI grab (Hermes AMD micro + Ampere x2, Ubuntu)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут
+    - cron: "*/30 * * * *"   # перезапускает job; GitHub троттлит cron, но
+                             #  внутри job есть свой цикл на ~5.5 ч (см. ниже)
   workflow_dispatch: {}
 
 concurrency:
   group: oci-grab
-  cancel-in-progress: false
+  cancel-in-progress: false   # max 1 активный + 1 ожидающий → бесшовная передача
 
 env:
   # --- OCI auth (существующие секреты) ---
@@ -21,29 +22,31 @@ env:
   TG_TOKEN:            ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TG_CHAT:             ${{ secrets.TELEGRAM_CHAT_ID }}
   # --- параметры цели ---
-  SUBNET_NAME:    "subnet-20260607-0926"   # резолвится в OCID на лету; при необходимости поменяй имя
-  SSH_PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0gCdXBEqV1WciB81/PlAT4kIgTVSROdANvY5mY23Hx nikita@openclaw"
-  UBUNTU_OS:      "Canonical Ubuntu"
-  UBUNTU_VER:     "24.04"
+  SUBNET_NAME:      "subnet-20260607-0926"   # резолвится в OCID на лету
+  SSH_PUBLIC_KEY:   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0gCdXBEqV1WciB81/PlAT4kIgTVSROdANvY5mY23Hx nikita@openclaw"
+  UBUNTU_OS:        "Canonical Ubuntu"
+  UBUNTU_VER:       "24.04"
+  POLL_INTERVAL_MIN: "30"   # как часто пробовать внутри job (минут)
+  LOOP_MINUTES:      "330"  # сколько job крутит цикл (5.5 ч), < timeout-minutes
 
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 350      # > LOOP_MINUTES, с запасом
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Grab free-tier capacity
+      - name: Grab free-tier capacity (loop)
         run: |
-          # GitHub запускает run-блок через `bash -e {0}` (errexit включён).
-          # У нас своя обработка кодов возврата launch(), поэтому errexit выключаем.
+          # GitHub запускает run-блок через `bash -e {0}`; у нас своя обработка
+          # кодов возврата launch(), поэтому errexit выключаем.
           set +e
 
           notify() { curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
                        -d chat_id="${TG_CHAT}" -d text="$1" >/dev/null || true; }
 
-          # ---------- placement (резолвим, чтобы не хардкодить OCID) ----------
+          # ---------- placement (резолвим один раз) ----------
           AD=$(oci iam availability-domain list --query 'data[0].name' --raw-output)
           SUBNET_ID=$(oci network subnet list -c "$COMPARTMENT_ID" \
                         --display-name "$SUBNET_NAME" --query 'data[0].id' --raw-output)
@@ -56,22 +59,9 @@ jobs:
 
           META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
 
-          # ---------- текущее использование (не-terminated инстансы) ----------
-          INSTS=$(oci compute instance list -c "$COMPARTMENT_ID" --all \
-                    --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING']" 2>/dev/null)
-          [ -z "$INSTS" ] && INSTS='[]'
-          n_e2=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.E2.1.Micro")]|length')
-          n_a1=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.A1.Flex")]|length')
-          a1_ocpus=$(echo "$INSTS" | jq '([.[]|select(.shape=="VM.Standard.A1.Flex")|."shape-config".ocpus]|add // 0)|floor')
-          echo "Usage: E2.1.Micro=$n_e2/2 ; A1 instances=$n_a1 ; A1 ocpus=$a1_ocpus/4"
-
-          # свободные слоты в Always Free
-          amd_free=$([ "$n_e2" -lt 2 ] && echo 1 || echo 0)                          # макс 2 AMD-микро
-          arm_free=$([ "$n_a1" -lt 2 ] && [ "$a1_ocpus" -le 2 ] && echo 1 || echo 0)  # ещё один 2/12 влезает
-
           exists() { echo "$INSTS" | jq -e --arg n "$1" 'any(.[]; ."display-name"==$n)' >/dev/null; }
 
-          ubuntu_img() {  # $1 = shape ; вернёт OCID свежего Ubuntu под арх. этого шейпа
+          ubuntu_img() {  # $1 = shape ; OCID свежего Ubuntu под арх. этого шейпа
             oci compute image list -c "$COMPARTMENT_ID" \
               --operating-system "$UBUNTU_OS" --operating-system-version "$UBUNTU_VER" \
               --shape "$1" --sort-by TIMECREATED --sort-order DESC \
@@ -89,7 +79,7 @@ jobs:
             imgname=$(oci compute image get --image-id "$img" --query 'data."display-name"' --raw-output 2>/dev/null || echo "?")
             echo ">> launch '$name' shape=$shape image=$imgname ($img)"
             case "$imgname" in
-              *Ubuntu*) : ;;  # ок, это Ubuntu
+              *Ubuntu*) : ;;
               *) echo "⚠️ ВНИМАНИЕ: образ не похож на Ubuntu: $imgname";;
             esac
             local err
@@ -104,53 +94,85 @@ jobs:
             return 1
           }
 
-          # ---------- чередование: каждый запуск пробуем ОДНУ цель ----------
-          slot=$(( ($(date +%s) / 600) % 2 ))      # 0 = AMD, 1 = Ampere
-          [ "$slot" -eq 0 ] && order="amd ampere" || order="ampere amd"
-          echo "slot=$slot order=$order"
+          # одна попытка: возвращает 2, если ловить больше нечего (все цели заняты)
+          one_attempt() {
+            INSTS=$(oci compute instance list -c "$COMPARTMENT_ID" --all \
+                      --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING']" 2>/dev/null)
+            [ -z "$INSTS" ] && INSTS='[]'
+            local n_e2 n_a1 a1_ocpus amd_free arm_free
+            n_e2=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.E2.1.Micro")]|length')
+            n_a1=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.A1.Flex")]|length')
+            a1_ocpus=$(echo "$INSTS" | jq '([.[]|select(.shape=="VM.Standard.A1.Flex")|."shape-config".ocpus]|add // 0)|floor')
+            echo "Usage: E2.1.Micro=$n_e2/2 ; A1 instances=$n_a1 ; A1 ocpus=$a1_ocpus/4"
+            amd_free=$([ "$n_e2" -lt 2 ] && echo 1 || echo 0)
+            arm_free=$([ "$n_a1" -lt 2 ] && [ "$a1_ocpus" -le 2 ] && echo 1 || echo 0)
 
-          for target in $order; do
-
-            # ----- AMD micro (Hermes) -----
-            if [ "$target" = "amd" ]; then
-              if [ "$amd_free" != 1 ] || exists "Hermes"; then
-                echo "AMD: слот занят/недоступен — пропускаю"; continue
-              fi
-              rc=0; launch "Hermes" "VM.Standard.E2.1.Micro" || rc=$?
-              case $rc in
-                0)  notify "✅ Hermes (AMD E2.1.Micro, Ubuntu) создан! Смотри IP в OCI Console."; exit 0;;
-                10) echo "AMD: нет ёмкости, ждём следующего слота"; exit 0;;
-                20) echo "AMD: rate-limit, ждём"; exit 0;;
-                *)  notify "⚠️ OCI-grab: Hermes launch упал (не ёмкость). Смотри лог Actions."; exit 1;;
-              esac
+            if [ "$amd_free" = 0 ] && [ "$arm_free" = 0 ]; then
+              return 2   # всё занято
             fi
 
-            # ----- Ampere A1.Flex 2/12 (Ampere 1, затем Ampere 2) -----
-            if [ "$target" = "ampere" ]; then
-              if [ "$arm_free" != 1 ]; then
-                echo "Ampere: ARM-пул занят — пропускаю"; continue
-              fi
-              name="Ampere 1"; exists "Ampere 1" && name="Ampere 2"
-              if exists "$name"; then echo "Ampere: оба имени заняты"; continue; fi
+            local slot order rc rc2 name
+            slot=$(( ($(date +%s) / 600) % 2 ))      # 0 = AMD, 1 = Ampere
+            [ "$slot" -eq 0 ] && order="amd ampere" || order="ampere amd"
+            echo "slot=$slot order=$order"
 
-              rc=0; launch "$name" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}' || rc=$?
-              case $rc in
-                0)
-                  notify "✅ $name (Ampere A1.Flex 2 OCPU / 12 GB, Ubuntu) создан!"
-                  # поймали первый Ampere из пустого пула → сразу пробуем второй
-                  if [ "$name" = "Ampere 1" ] && [ "$a1_ocpus" -eq 0 ]; then
-                    echo ">> сразу пробуем второй Ampere"
-                    sleep 5
-                    rc2=0; launch "Ampere 2" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}' || rc2=$?
-                    [ "$rc2" -eq 0 ] && notify "✅ Ampere 2 (A1.Flex 2/12, Ubuntu) тоже создан! ARM-пул заполнен (4/24)." \
-                                     || echo "Второй Ampere пока не поймался (rc=$rc2), добьём в следующем слоте."
-                  fi
-                  exit 0;;
-                10) echo "Ampere: нет ёмкости, ждём следующего слота"; exit 0;;
-                20) echo "Ampere: rate-limit, ждём"; exit 0;;
-                *)  notify "⚠️ OCI-grab: $name launch упал (не ёмкость). Смотри лог Actions."; exit 1;;
-              esac
+            for target in $order; do
+              if [ "$target" = "amd" ]; then
+                if [ "$amd_free" != 1 ] || exists "Hermes"; then
+                  echo "AMD: недоступен/занят — пропуск"; continue
+                fi
+                rc=0; launch "Hermes" "VM.Standard.E2.1.Micro" || rc=$?
+                case $rc in
+                  0)  notify "✅ Hermes (AMD E2.1.Micro, Ubuntu) создан! Смотри IP в OCI Console.";;
+                  10) echo "AMD: нет ёмкости";;
+                  20) echo "AMD: rate-limit";;
+                  *)  notify "⚠️ OCI-grab: Hermes launch упал (не ёмкость). Лог Actions."; exit 1;;
+                esac
+                return 0
+              fi
+              if [ "$target" = "ampere" ]; then
+                if [ "$arm_free" != 1 ]; then echo "Ampere: пул занят — пропуск"; continue; fi
+                name="Ampere 1"; exists "Ampere 1" && name="Ampere 2"
+                if exists "$name"; then echo "Ampere: оба имени заняты"; continue; fi
+                rc=0; launch "$name" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}' || rc=$?
+                case $rc in
+                  0)
+                    notify "✅ $name (Ampere A1.Flex 2 OCPU / 12 GB, Ubuntu) создан!"
+                    if [ "$name" = "Ampere 1" ] && [ "$a1_ocpus" -eq 0 ]; then
+                      echo ">> сразу пробуем второй Ampere"
+                      sleep 5
+                      rc2=0; launch "Ampere 2" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}' || rc2=$?
+                      [ "$rc2" -eq 0 ] && notify "✅ Ampere 2 (A1.Flex 2/12, Ubuntu) тоже создан! ARM-пул заполнен (4/24)."
+                    fi;;
+                  10) echo "Ampere: нет ёмкости";;
+                  20) echo "Ampere: rate-limit";;
+                  *)  notify "⚠️ OCI-grab: $name launch упал (не ёмкость). Лог Actions."; exit 1;;
+                esac
+                return 0
+              fi
+            done
+            return 0
+          }
+
+          # ---------- цикл на ~LOOP_MINUTES, попытка раз в POLL_INTERVAL_MIN ----------
+          INTERVAL=$(( POLL_INTERVAL_MIN * 60 ))
+          END=$(( $(date +%s) + LOOP_MINUTES * 60 ))
+          i=0
+          while : ; do
+            i=$(( i + 1 ))
+            echo "===== попытка #$i  $(date -u '+%Y-%m-%d %H:%M:%SZ') ====="
+            one_attempt; rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "Все цели заняты — ловить больше нечего. Выходим."
+              exit 0
             fi
+            now=$(date +%s)
+            if [ "$now" -ge "$END" ]; then
+              echo "Окно цикла (~${LOOP_MINUTES}м) истекло — выходим, расписание перезапустит."
+              exit 0
+            fi
+            s=$INTERVAL
+            rem=$(( END - now )); [ "$rem" -lt "$s" ] && s=$rem
+            echo "Спим ${s}s до следующей попытки..."
+            sleep "$s"
           done
-
-          echo "В этот запуск ловить нечего: все цели заняты или квоты исчерпаны."
