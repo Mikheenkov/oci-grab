@@ -22,46 +22,76 @@ env:
   TG_TOKEN:            ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TG_CHAT:             ${{ secrets.TELEGRAM_CHAT_ID }}
   # --- параметры цели ---
-  SUBNET_NAME:      "subnet-20260607-0926"   # резолвится в OCID на лету
-  SSH_PUBLIC_KEY:   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0gCdXBEqV1WciB81/PlAT4kIgTVSROdANvY5mY23Hx nikita@openclaw"
-  UBUNTU_OS:        "Canonical Ubuntu"
-  UBUNTU_VER:       "24.04"
-  POLL_INTERVAL_MIN: "30"   # как часто пробовать внутри job (минут)
-  LOOP_MINUTES:      "330"  # сколько job крутит цикл (5.5 ч), < timeout-minutes
+  SUBNET_NAME:       "subnet-20260607-0926"   # резолвится в OCID на лету
+  SSH_PUBLIC_KEY:    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0gCdXBEqV1WciB81/PlAT4kIgTVSROdANvY5mY23Hx nikita@openclaw"
+  UBUNTU_OS:         "Canonical Ubuntu"
+  UBUNTU_VER:        "24.04"
+  POLL_INTERVAL_MIN: "30"             # как часто пробовать внутри job (минут)
+  LOOP_MINUTES:      "330"            # сколько job крутит цикл (5.5 ч), < timeout
+  # --- суточный отчёт ---
+  REPORT_TZ:         "Europe/Madrid"  # часовой пояс для границы суток
+  REPORT_HOUR:       "10"             # во сколько (час, по REPORT_TZ) слать сводку
 
 jobs:
   grab:
     runs-on: ubuntu-latest
     timeout-minutes: 350      # > LOOP_MINUTES, с запасом
     steps:
+      - name: Restore stats
+        uses: actions/cache/restore@v4
+        with:
+          path: stats.json
+          key: grab-stats-restore-${{ github.run_id }}   # намеренно не совпадает → берётся свежий по префиксу
+          restore-keys: |
+            grab-stats-
+
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Grab free-tier capacity (loop)
+      - name: Grab free-tier capacity (loop + daily report)
         run: |
           # GitHub запускает run-блок через `bash -e {0}`; у нас своя обработка
           # кодов возврата launch(), поэтому errexit выключаем.
           set +e
 
           notify() { curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-                       -d chat_id="${TG_CHAT}" -d text="$1" >/dev/null || true; }
+                       -d chat_id="${TG_CHAT}" --data-urlencode "text=$1" >/dev/null || true; }
+
+          # ---------- суточные счётчики (persisted через Actions cache) ----------
+          if [ -f stats.json ]; then
+            AMD_CNT=$(jq -r '.amd // 0'          stats.json)
+            AMP_CNT=$(jq -r '.ampere // 0'       stats.json)
+            AMD_TOT=$(jq -r '.amd_total // 0'    stats.json)
+            AMP_TOT=$(jq -r '.ampere_total // 0' stats.json)
+            LAST_REPORT=$(jq -r '.last_report // empty' stats.json)
+          else
+            AMD_CNT=0; AMP_CNT=0; AMD_TOT=0; AMP_TOT=0; LAST_REPORT=""
+          fi
+          [ -z "$LAST_REPORT" ] && LAST_REPORT=$(TZ="$REPORT_TZ" date +%F)
+          G_HERMES=0; G_AMPERE=0
+
+          write_stats() {
+            jq -n --argjson a "${AMD_CNT:-0}" --argjson b "${AMP_CNT:-0}" \
+                  --argjson c "${AMD_TOT:-0}" --argjson d "${AMP_TOT:-0}" \
+                  --arg lr "$LAST_REPORT" \
+              '{amd:$a, ampere:$b, amd_total:$c, ampere_total:$d, last_report:$lr}' > stats.json
+          }
+          trap write_stats EXIT   # при любом выходе шага stats.json актуален → его сохранит cache/save
 
           # ---------- placement (резолвим один раз) ----------
           AD=$(oci iam availability-domain list --query 'data[0].name' --raw-output)
           SUBNET_ID=$(oci network subnet list -c "$COMPARTMENT_ID" \
                         --display-name "$SUBNET_NAME" --query 'data[0].id' --raw-output)
-          echo "AD=$AD"
-          echo "SUBNET=$SUBNET_ID"
+          echo "AD=$AD"; echo "SUBNET=$SUBNET_ID"
           if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "null" ]; then
             notify "⚠️ OCI-grab: subnet '$SUBNET_NAME' не найдена. Проверь имя/VCN."
             echo "Subnet not found"; exit 1
           fi
-
           META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
 
           exists() { echo "$INSTS" | jq -e --arg n "$1" 'any(.[]; ."display-name"==$n)' >/dev/null; }
 
-          ubuntu_img() {  # $1 = shape ; OCID свежего Ubuntu под арх. этого шейпа
+          ubuntu_img() {
             oci compute image list -c "$COMPARTMENT_ID" \
               --operating-system "$UBUNTU_OS" --operating-system-version "$UBUNTU_VER" \
               --shape "$1" --sort-by TIMECREATED --sort-order DESC \
@@ -78,10 +108,7 @@ jobs:
             local imgname
             imgname=$(oci compute image get --image-id "$img" --query 'data."display-name"' --raw-output 2>/dev/null || echo "?")
             echo ">> launch '$name' shape=$shape image=$imgname ($img)"
-            case "$imgname" in
-              *Ubuntu*) : ;;
-              *) echo "⚠️ ВНИМАНИЕ: образ не похож на Ubuntu: $imgname";;
-            esac
+            case "$imgname" in *Ubuntu*) : ;; *) echo "⚠️ образ не похож на Ubuntu: $imgname";; esac
             local err
             err=$(oci compute instance launch \
                     --availability-domain "$AD" -c "$COMPARTMENT_ID" \
@@ -89,43 +116,39 @@ jobs:
                     --assign-public-ip true --display-name "$name" \
                     --metadata "$META" "$@" 2>&1) && { echo "OK: $name"; return 0; }
             echo "$err" | tail -6
-            echo "$err" | grep -qiE "out of (host )?capacity|capacity"        && return 10
-            echo "$err" | grep -qiE "too many requests|toomanyrequests|429"   && return 20
+            echo "$err" | grep -qiE "out of (host )?capacity|capacity"      && return 10
+            echo "$err" | grep -qiE "too many requests|toomanyrequests|429" && return 20
             return 1
           }
 
-          # одна попытка: возвращает 2, если ловить больше нечего (все цели заняты)
+          # одна попытка; rc=2 значит ловить больше нечего (все цели заняты)
           one_attempt() {
             INSTS=$(oci compute instance list -c "$COMPARTMENT_ID" --all \
                       --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING']" 2>/dev/null)
             [ -z "$INSTS" ] && INSTS='[]'
-            local n_e2 n_a1 a1_ocpus amd_free arm_free
+            local n_e2 n_a1 a1_ocpus amd_free arm_free rc rc2 name
             n_e2=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.E2.1.Micro")]|length')
             n_a1=$(echo "$INSTS"    | jq '[.[]|select(.shape=="VM.Standard.A1.Flex")]|length')
             a1_ocpus=$(echo "$INSTS" | jq '([.[]|select(.shape=="VM.Standard.A1.Flex")|."shape-config".ocpus]|add // 0)|floor')
+            G_HERMES=$(exists "Hermes" && echo 1 || echo 0); G_AMPERE=$n_a1
             echo "Usage: E2.1.Micro=$n_e2/2 ; A1 instances=$n_a1 ; A1 ocpus=$a1_ocpus/4"
             amd_free=$([ "$n_e2" -lt 2 ] && echo 1 || echo 0)
             arm_free=$([ "$n_a1" -lt 2 ] && [ "$a1_ocpus" -le 2 ] && echo 1 || echo 0)
+            [ "$amd_free" = 0 ] && [ "$arm_free" = 0 ] && return 2
 
-            if [ "$amd_free" = 0 ] && [ "$arm_free" = 0 ]; then
-              return 2   # всё занято
-            fi
-
-            local slot order rc rc2 name
-            slot=$(( ($(date +%s) / 600) % 2 ))      # 0 = AMD, 1 = Ampere
+            local slot order
+            slot=$(( ($(date +%s) / 600) % 2 ))
             [ "$slot" -eq 0 ] && order="amd ampere" || order="ampere amd"
             echo "slot=$slot order=$order"
 
             for target in $order; do
               if [ "$target" = "amd" ]; then
-                if [ "$amd_free" != 1 ] || exists "Hermes"; then
-                  echo "AMD: недоступен/занят — пропуск"; continue
-                fi
+                if [ "$amd_free" != 1 ] || exists "Hermes"; then echo "AMD: пропуск"; continue; fi
                 rc=0; launch "Hermes" "VM.Standard.E2.1.Micro" || rc=$?
+                AMD_CNT=$((AMD_CNT+1)); AMD_TOT=$((AMD_TOT+1))
                 case $rc in
                   0)  notify "✅ Hermes (AMD E2.1.Micro, Ubuntu) создан! Смотри IP в OCI Console.";;
-                  10) echo "AMD: нет ёмкости";;
-                  20) echo "AMD: rate-limit";;
+                  10) echo "AMD: нет ёмкости";; 20) echo "AMD: rate-limit";;
                   *)  notify "⚠️ OCI-grab: Hermes launch упал (не ёмкость). Лог Actions."; exit 1;;
                 esac
                 return 0
@@ -135,23 +158,37 @@ jobs:
                 name="Ampere 1"; exists "Ampere 1" && name="Ampere 2"
                 if exists "$name"; then echo "Ampere: оба имени заняты"; continue; fi
                 rc=0; launch "$name" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}' || rc=$?
+                AMP_CNT=$((AMP_CNT+1)); AMP_TOT=$((AMP_TOT+1))
                 case $rc in
                   0)
                     notify "✅ $name (Ampere A1.Flex 2 OCPU / 12 GB, Ubuntu) создан!"
                     if [ "$name" = "Ampere 1" ] && [ "$a1_ocpus" -eq 0 ]; then
-                      echo ">> сразу пробуем второй Ampere"
-                      sleep 5
+                      echo ">> сразу пробуем второй Ampere"; sleep 5
                       rc2=0; launch "Ampere 2" "VM.Standard.A1.Flex" --shape-config '{"ocpus":2,"memoryInGBs":12}' || rc2=$?
+                      AMP_CNT=$((AMP_CNT+1)); AMP_TOT=$((AMP_TOT+1))
                       [ "$rc2" -eq 0 ] && notify "✅ Ampere 2 (A1.Flex 2/12, Ubuntu) тоже создан! ARM-пул заполнен (4/24)."
                     fi;;
-                  10) echo "Ampere: нет ёмкости";;
-                  20) echo "Ampere: rate-limit";;
+                  10) echo "Ampere: нет ёмкости";; 20) echo "Ampere: rate-limit";;
                   *)  notify "⚠️ OCI-grab: $name launch упал (не ёмкость). Лог Actions."; exit 1;;
                 esac
                 return 0
               fi
             done
             return 0
+          }
+
+          maybe_daily_report() {
+            local today hr
+            today=$(TZ="$REPORT_TZ" date +%F)
+            hr=$(TZ="$REPORT_TZ" date +%H); hr=$((10#$hr))
+            if [ "$LAST_REPORT" != "$today" ] && [ "$hr" -ge "$REPORT_HOUR" ]; then
+              local hstat msg
+              hstat=$([ "$G_HERMES" = 1 ] && echo "поймана" || echo "ищем")
+              msg=$(printf '📊 OCI-grab — суточный отчёт (за %s)\n• AMD micro (Hermes): %s попыток\n• Ampere 2/12: %s попыток\nСтатус: Hermes — %s ; Ampere — %s/2\nВсего за всё время: AMD %s, Ampere %s' \
+                    "$LAST_REPORT" "$AMD_CNT" "$AMP_CNT" "$hstat" "$G_AMPERE" "$AMD_TOT" "$AMP_TOT")
+              notify "$msg"
+              AMD_CNT=0; AMP_CNT=0; LAST_REPORT="$today"; write_stats
+            fi
           }
 
           # ---------- цикл на ~LOOP_MINUTES, попытка раз в POLL_INTERVAL_MIN ----------
@@ -162,17 +199,23 @@ jobs:
             i=$(( i + 1 ))
             echo "===== попытка #$i  $(date -u '+%Y-%m-%d %H:%M:%SZ') ====="
             one_attempt; rc=$?
+            maybe_daily_report
+            write_stats
             if [ "$rc" -eq 2 ]; then
-              echo "Все цели заняты — ловить больше нечего. Выходим."
-              exit 0
+              echo "Все цели заняты — ловить больше нечего. Выходим."; exit 0
             fi
             now=$(date +%s)
             if [ "$now" -ge "$END" ]; then
-              echo "Окно цикла (~${LOOP_MINUTES}м) истекло — выходим, расписание перезапустит."
-              exit 0
+              echo "Окно цикла (~${LOOP_MINUTES}м) истекло — выходим, расписание перезапустит."; exit 0
             fi
-            s=$INTERVAL
-            rem=$(( END - now )); [ "$rem" -lt "$s" ] && s=$rem
+            s=$INTERVAL; rem=$(( END - now )); [ "$rem" -lt "$s" ] && s=$rem
             echo "Спим ${s}s до следующей попытки..."
             sleep "$s"
           done
+
+      - name: Save stats
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: stats.json
+          key: grab-stats-${{ github.run_id }}
