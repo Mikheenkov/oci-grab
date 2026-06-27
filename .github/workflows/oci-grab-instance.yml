@@ -2,8 +2,10 @@ name: OCI grab (Hermes AMD micro + Ampere x2, Ubuntu)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # перезапускает job; GitHub троттлит cron, но
-                             #  внутри job есть свой цикл на ~5.5 ч (см. ниже)
+    - cron: "0 */6 * * *"    # лишь ПЕРЕЗАПУСКАЕТ цикл (job сам крутит ~5.5 ч).
+                             #  Раз в 6 ч, чтобы расписание не плодило отменённые
+                             #  прогоны из-за concurrency. Реальный опрос — каждые
+                             #  POLL_INTERVAL_MIN внутри job.
   workflow_dispatch: {}
 
 concurrency:
@@ -27,7 +29,8 @@ env:
   UBUNTU_OS:         "Canonical Ubuntu"
   UBUNTU_VER:        "24.04"
   POLL_INTERVAL_MIN: "30"             # как часто пробовать внутри job (минут)
-  LOOP_MINUTES:      "330"            # сколько job крутит цикл (5.5 ч), < timeout
+  LOOP_MINUTES:      "345"            # сколько job крутит цикл (~5.75 ч), < timeout;
+                                      #  чуть меньше 6 ч → почти бесшовная стыковка с cron
   # --- суточный отчёт ---
   REPORT_TZ:         "Europe/Madrid"  # часовой пояс для границы суток
   REPORT_HOUR:       "10"             # во сколько (час, по REPORT_TZ) слать сводку
