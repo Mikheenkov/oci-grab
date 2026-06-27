@@ -116,9 +116,15 @@ jobs:
                     --assign-public-ip true --display-name "$name" \
                     --metadata "$META" "$@" 2>&1) && { echo "OK: $name"; return 0; }
             echo "$err" | tail -6
-            echo "$err" | grep -qiE "out of (host )?capacity|capacity"      && return 10
-            echo "$err" | grep -qiE "too many requests|toomanyrequests|429" && return 20
-            return 1
+            local el; el=$(echo "$err" | tr 'A-Z' 'a-z')
+            case "$el" in
+              *"out of host capacity"*|*"out of capacity"*)                 return 10 ;;  # нет ёмкости
+              *"too many requests"*|*toomanyrequests*|*'"status": 429'*)    return 20 ;;  # троттлинг
+              *"timed out"*|*timeout*|*"could not connect"*|*"connection"*|*"max retries"*|\
+              *"internalerror"*|*'"status": 500'*|*'"status": 502'*|*'"status": 503'*|*"service unavailable"*) \
+                                                                            return 30 ;;  # транзиентное → повтор
+              *)                                                            return 1  ;;  # реальная ошибка
+            esac
           }
 
           # одна попытка; rc=2 значит ловить больше нечего (все цели заняты)
@@ -149,7 +155,8 @@ jobs:
                 case $rc in
                   0)  notify "✅ Hermes (AMD E2.1.Micro, Ubuntu) создан! Смотри IP в OCI Console.";;
                   10) echo "AMD: нет ёмкости";; 20) echo "AMD: rate-limit";;
-                  *)  notify "⚠️ OCI-grab: Hermes launch упал (не ёмкость). Лог Actions."; exit 1;;
+                  30) echo "AMD: транзиентная ошибка (timeout/5xx) — повтор позже";;
+                  *)  notify "⚠️ OCI-grab: Hermes launch упал (реальная ошибка, не ёмкость/таймаут). Лог Actions."; exit 1;;
                 esac
                 return 0
               fi
@@ -169,7 +176,8 @@ jobs:
                       [ "$rc2" -eq 0 ] && notify "✅ Ampere 2 (A1.Flex 2/12, Ubuntu) тоже создан! ARM-пул заполнен (4/24)."
                     fi;;
                   10) echo "Ampere: нет ёмкости";; 20) echo "Ampere: rate-limit";;
-                  *)  notify "⚠️ OCI-grab: $name launch упал (не ёмкость). Лог Actions."; exit 1;;
+                  30) echo "Ampere: транзиентная ошибка (timeout/5xx) — повтор позже";;
+                  *)  notify "⚠️ OCI-grab: $name launch упал (реальная ошибка, не ёмкость/таймаут). Лог Actions."; exit 1;;
                 esac
                 return 0
               fi
